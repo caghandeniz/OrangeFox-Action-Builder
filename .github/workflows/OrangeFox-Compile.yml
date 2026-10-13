@@ -1,10 +1,4 @@
-name: OrangeFox - Build
-
-# Credits to:
-# https://github.com/TeamWin
-# https://gitlab.com/OrangeFox
-# https://github.com/azwhikaru for Recovery Builder Template
-# And all Contributors in every repositories I used
+name: OrangeFox - Build (B2_Ultra)
 
 on:
   workflow_dispatch:
@@ -20,23 +14,23 @@ on:
       DEVICE_TREE:
         description: 'OrangeFox Device Tree'
         required: true
-        default: 'https://github.com/cd-Crypton/custom_recovery_tree_realme_nashc'
+        default: 'https://github.com/caghandeniz/orangefox_device_ant_B2_Ultra'
       DEVICE_TREE_BRANCH:
         description: 'OrangeFox Device Tree Branch'
         required: true
-        default: 'android-12.1'
+        default: 'main'
       DEVICE_PATH:
         description: 'Specify your Device Path'
         required: true
-        default: 'device/realme/nashc'
+        default: 'device/ant/B2_Ultra'
       DEVICE_NAME:
         description: 'Specify your Device Codename'
         required: true
-        default: 'nashc'
+        default: 'B2_Ultra'
       BUILD_TARGET:
         description: 'Specify your Build Target'
         required: true
-        default: 'recovery'
+        default: 'vendorboot'
         type: choice
         options:
         - boot
@@ -52,26 +46,25 @@ jobs:
     permissions:
       contents: write
     steps:
-    - name: Checkout
+    - name: Checkout (stock files)
       uses: actions/checkout@v4
-              
+
     - name: Clean-up
       uses: rokibhasansagar/slimhub_actions@main
 
     - name: Swap Space
       uses: pierotofy/set-swap-space@master
       with:
-        swap-size-gb: 24
-      
+        swap-size-gb: 8
+
     - name: Build Environment
       run: |
-        sudo apt install aria2 -y
+        sudo apt install aria2 lz4 cpio -y
         git clone https://gitlab.com/OrangeFox/misc/scripts.git -b master
         cd scripts
         sudo bash setup/android_build_env.sh
-      
+
     - name: Set-up Manifest
-      if: inputs.MANIFEST_BRANCH == '11.0' || inputs.MANIFEST_BRANCH == '12.1'
       run: |
         mkdir -p ${GITHUB_WORKSPACE}/OrangeFox
         cd ${GITHUB_WORKSPACE}/OrangeFox
@@ -79,14 +72,26 @@ jobs:
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
         git clone https://gitlab.com/OrangeFox/sync.git -b master
         cd sync
+        sed -i -E 's/repo sync/repo sync -c --no-clone-bundle --no-tags -j4/g' orangefox_sync.sh
+        sed -i -E 's/git clone( -q)? /git clone --depth=1\1 /g' orangefox_sync.sh
         ./orangefox_sync.sh --branch ${{ inputs.MANIFEST_BRANCH }} --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
+        du -sh ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }} || true
+        df -BG / | tail -1
 
     - name: Clone Device Tree
       run: |
         cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
-        git clone ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ./${{ inputs.DEVICE_PATH }}
+        git clone --depth=1 ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ./${{ inputs.DEVICE_PATH }}
         cd ${{ inputs.DEVICE_PATH }}
+        # twrp_ adli makefile gelirse fox_ adina cevir (zaten fox_ ise dokunmaz)
+        if [ -f twrp_${{ inputs.DEVICE_NAME }}.mk ]; then
+          mv twrp_${{ inputs.DEVICE_NAME }}.mk fox_${{ inputs.DEVICE_NAME }}.mk
+          sed -i "s/PRODUCT_NAME := twrp_${{ inputs.DEVICE_NAME }}/PRODUCT_NAME := fox_${{ inputs.DEVICE_NAME }}/" fox_${{ inputs.DEVICE_NAME }}.mk
+          sed -i "s/twrp_${{ inputs.DEVICE_NAME }}/fox_${{ inputs.DEVICE_NAME }}/g" AndroidProducts.mk vendorsetup.sh 2>/dev/null || true
+        fi
         echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
+        ls *.mk
+        grep -n "PIXEL_FORMAT\|PLATFORM_VERSION" BoardConfig.mk
 
     - name: Building OrangeFox
       run: |
@@ -95,13 +100,46 @@ jobs:
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         set -e
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng && make clean && mka adbd ${{ inputs.BUILD_TARGET }}image
+        lunch fox_${{ inputs.DEVICE_NAME }}-eng && make clean && mka adbd ${{ inputs.BUILD_TARGET }}image
+
+    - name: Merge vendor_boot with stock platform ramdisk
+      if: inputs.BUILD_TARGET == 'vendorboot'
+      run: |
+        set -e
+        cd "$HOME"
+        git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+        OFX_IMG=${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/vendor_boot.img
+        [ -f "$OFX_IMG" ] || { echo "HATA: vendor_boot.img yok"; exit 1; }
+
+        rm -rf "$HOME/mrg" && mkdir -p "$HOME/mrg/unp"
+        python3 mkbootimg/unpack_bootimg.py --boot_img "$OFX_IMG" --out "$HOME/mrg/unp" > "$HOME/mrg/hdr.txt"
+        cat "$HOME/mrg/hdr.txt"
+
+        REC="$HOME/mrg/unp/vendor_ramdisk01"
+        [ -f "$REC" ] || { echo "HATA: recovery ramdisk entry'si yok"; ls "$HOME/mrg/unp"; exit 1; }
+        case "$(file -b "$REC")" in
+          *gzip*) zcat "$REC" | lz4 -l -9 -f - "$HOME/mrg/rec.lz4" ;;
+          *LZ4*|*lz4*) cp "$REC" "$HOME/mrg/rec.lz4" ;;
+          *) echo "HATA: bilinmeyen sikistirma: $(file -b "$REC")"; exit 1 ;;
+        esac
+
+        S="$GITHUB_WORKSPACE/stock"
+        [ -f "$S/platform_ramdisk.lz4" ] || { echo "HATA: stock/platform_ramdisk.lz4 yok"; exit 1; }
+
+        python3 mkbootimg/mkbootimg.py --header_version 4 --pagesize 0x00001000 --base 0x00000000 \
+          --kernel_offset 0x40000000 --ramdisk_offset 0x66f00000 --tags_offset 0x47c80000 \
+          --dtb_offset 0x0000000047c80000 --vendor_cmdline 'bootopt=64S3,32N2,64N2' --board '' \
+          --dtb "$S/dtb" --vendor_bootconfig "$S/bootconfig" \
+          --ramdisk_type platform --ramdisk_name '' --vendor_ramdisk_fragment "$S/platform_ramdisk.lz4" \
+          --ramdisk_type recovery --ramdisk_name recovery --vendor_ramdisk_fragment "$HOME/mrg/rec.lz4" \
+          --vendor_boot "$GITHUB_WORKSPACE/vendor_boot_ready.img"
+
+        python3 mkbootimg/unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/vendor_boot_ready.img" --out "$HOME/mrg/chk" | grep -E "ramdisk total|dtb address|command line|vendor_ramdisk0"
+        ls -l "$GITHUB_WORKSPACE/vendor_boot_ready.img"
 
     - name: Set Release Properties
       run: |
-        echo "BUILD_DATE=$(TZ=Asia/Manila date +%Y%m%d)" >> $GITHUB_ENV
-        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
-
+        echo "BUILD_DATE=$(TZ=Europe/Istanbul date +%Y%m%d)" >> $GITHUB_ENV
         DEVICE_TREE_URL="${{ inputs.DEVICE_TREE }}"
         if [[ "${DEVICE_TREE_URL}" == *.git ]]; then
           DEVICE_TREE_URL="${DEVICE_TREE_URL%.git}"
@@ -112,6 +150,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
+          ${{ github.workspace }}/vendor_boot_ready.img
           OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.img
           OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.zip
         name: OrangeFox Recovery for ${{ inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
@@ -119,6 +158,7 @@ jobs:
         body: |
           ## OrangeFox Recovery Build - Unofficial
           Build: fox_${{ inputs.MANIFEST_BRANCH }}
+          Target: ${{ inputs.BUILD_TARGET }}
           Device: [Device Tree/Branch](${{ env.DEVICE_TREE_URL }}/tree/${{ inputs.DEVICE_TREE_BRANCH }})
           Commit: Most recent [commit](${{ env.DEVICE_TREE_URL }}/commit/${{ env.COMMIT_ID }}) during building.
-          
+          Hazir imaj (vendor_boot_ready.img): recovery ramdisk + stok platform ramdisk, stok header.
